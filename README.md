@@ -38,7 +38,7 @@ Citations:
 
 ## Run the code
 
-As part of DT4H WP3, we have implemented a pseudo-perplexity evaluation function for RoBERTa models. The code is available in the `ppl.py` file in this repository. The approach followed in this work consists on calculating the pseudo-perplexity of a RoBERTa model using the Paraclite dataset. 
+As part of DT4H WP3, we have implemented a pseudo-perplexity evaluation function for RoBERTa models. The code is available in the `ppl.py` file in this repository. The approach followed in this work consists on calculating the pseudo-perplexity of a RoBERTa model using the Paraclite dataset.
 
 - **Step 1**: the segments corresponding to the same document are concatenated and converted into a single sequence.
 - **Step 2**: the sequence is tokenized using the RoBERTa tokenizer and chunked using a sliding window approach.
@@ -72,3 +72,7 @@ python ppl.py \
 A new folder named `output` will be created with the results of the evaluation. Negative log-likelihood and perplexity scores will be saved in a CSV file.
 
 For any questions or issues, please contact Alberto Becerra (abecerr1bsc@gmail.com).
+
+# TODO
+
+* Add [LMPPL](https://github.com/asahi417/lmppl) as backend

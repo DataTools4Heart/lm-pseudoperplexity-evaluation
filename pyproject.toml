@@ -4,6 +4,9 @@ version = "0.1.0"
 description = ""
 authors = ["dt4h"]
 readme = "README.md"
+packages = [
+    {include = "pppl", from = "src"}
+]
 
 [tool.poetry.dependencies]
 python = "^3.12"
@@ -12,6 +15,10 @@ torch = "^2.6.0"
 transformers = "^4.49.0"
 pandas = "^2.2.3"
 numpy = "^2.2.3"
+jupyter = "^1.1.1"
+seaborn = "^0.13.2"
+lmppl = "^0.3.2"
+gradio = "^5.49.1"
 
 
 [build-system]
