@@ -3,3 +3,5 @@ torch
 transformers
 pandas
 numpy
+lmppl
+minicons
