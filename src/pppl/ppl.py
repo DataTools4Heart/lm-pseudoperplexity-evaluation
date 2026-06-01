@@ -104,15 +104,15 @@ def create_iterative_masking(input_id: List[int], mask_token: int, pad_token_id:
     attention_mask = torch.ones_like(input_id)  # Create attention mask
     attention_mask[input_id == pad_token_id] = 0  # Set padding tokens to 0
 
-    n = input_id.shape[0]  # Number
-    n_pad = input_id[input_id == pad_token_id].shape[0]  # Number of padding tokens
+    valid_positions = torch.nonzero(input_id != pad_token_id).flatten()
+    n_valid = valid_positions.numel()
 
-    masked_sequence = input_id.repeat(n - n_pad, 1)
-    attention_mask = attention_mask.repeat(n - n_pad, 1)
+    masked_sequence = input_id.repeat(n_valid, 1)
+    attention_mask = attention_mask.repeat(n_valid, 1)
 
     if mask_token != -999:
-        # Replace diagonal elements with mask_token
-        masked_sequence.fill_diagonal_(mask_token)
+        # Replace one valid token per row with mask_token
+        masked_sequence[torch.arange(n_valid), valid_positions] = mask_token
 
     return masked_sequence, attention_mask
 
@@ -147,9 +147,12 @@ def multiple_masked_ids(
             input_id_out, attention_mask_out = create_iterative_masking(
                 row, mask_token=mask_token_id, pad_token_id=pad_token_id
             )
-            labels, _ = create_iterative_masking(
-                row, mask_token=-999, pad_token_id=pad_token_id
-            )
+            row_tensor = torch.tensor(row, dtype=torch.long)
+            valid_positions = torch.nonzero(row_tensor != pad_token_id).flatten()
+            labels = torch.full_like(input_id_out, -100)
+            labels[torch.arange(valid_positions.numel()), valid_positions] = row_tensor[
+                valid_positions
+            ]
             ls_rows_input_id.extend(input_id_out)
             ls_rows_attention_mask.extend(attention_mask_out)
             ls_labels.extend(labels)
@@ -161,7 +164,7 @@ def multiple_masked_ids(
     return {
         "input_ids": all_input_ids,
         "attention_mask": all_attention_masks,
-        "labels": all_input_ids,
+        "labels": all_labels,
     }
 
 
@@ -333,6 +336,8 @@ if __name__ == "__main__":
     n = tensor_ids.shape[0]
     # n = 256 # For testing purposes
     ls_nll = []
+    total_nll = 0.0
+    total_samples = 0
     d_analysis = {}
     for i in tqdm(range(0, n, batch_size)):
         batch_input_ids = tensor_ids[i : i + batch_size].to(device)
@@ -345,16 +350,20 @@ if __name__ == "__main__":
                 attention_mask=batch_attention_mask,
                 labels=batch_tensor_labels,
             )
-            neg_log_likelihood = output.loss  # Model loss corresponds to NLL
+            neg_log_likelihood = output.loss  # Mean NLL over masked tokens in the batch
 
-        ls_nll.append(neg_log_likelihood.item())
+        batch_nll = neg_log_likelihood.item()
+        batch_samples = batch_input_ids.size(0)
+        ls_nll.append(batch_nll)
+        total_nll += batch_nll * batch_samples
+        total_samples += batch_samples
         d_analysis[i] = {
-            "nll": neg_log_likelihood.item(),
+            "nll": batch_nll,
             "input_ids": batch_input_ids.cpu().tolist(),
         }
 
     ls_nll = torch.tensor(ls_nll)
-    nll_mean = ls_nll.mean()
+    nll_mean = torch.tensor(total_nll / total_samples)
     nll_median = ls_nll.median()
     ppl = torch.exp(nll_mean)
     ppl_median = torch.exp(nll_median)
