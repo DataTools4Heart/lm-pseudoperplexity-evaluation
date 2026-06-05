@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 import torch
@@ -84,13 +84,45 @@ def sliding_window_reshape_batch(
     return {"input_ids": all_input_ids, "attention_mask": all_attention_masks}
 
 
-def create_iterative_masking(input_id: List[int], mask_token: int, pad_token_id: int):
+def maskable_positions(
+    input_id: torch.Tensor,
+    pad_token_id: int,
+    special_ids: Optional[Iterable[int]] = None,
+) -> torch.Tensor:
+    """Return the indices that are eligible to be masked and scored.
+
+    A position is maskable if it is not padding and, when ``special_ids`` is
+    provided, not one of those special tokens. Special tokens are kept in
+    the sequence and are still attended to (so they provide context); they
+    are simply never masked nor scored. This lets callers exclude framing
+    tokens such as ``[CLS]``/``[SEP]`` from the perplexity computation.
+
+    - input_id: 1D tensor of token ids.
+    - pad_token_id: Token ID for padding.
+    - special_ids: Optional iterable of token IDs to exclude from masking.
+    """
+    maskable = input_id != pad_token_id
+    if special_ids:
+        special_tensor = torch.tensor(list(special_ids), dtype=input_id.dtype)
+        maskable &= ~torch.isin(input_id, special_tensor)
+    return torch.nonzero(maskable).flatten()
+
+
+def create_iterative_masking(
+    input_id: List[int],
+    mask_token: int,
+    pad_token_id: int,
+    special_ids: Optional[Iterable[int]] = None,
+):
     """
     Receives a list of integers, duplicated it and replaces each element with a mask_token.
 
     - input_id: List of integers.
     - mask_token: Token to replace the elements. If -999, no replacement is done. Useful for labels.
     - pad_token_id: Token ID for padding.
+    - special_ids: Optional iterable of token IDs to exclude from masking
+      (e.g. ``[CLS]``/``[SEP]``). Excluded tokens stay in the sequence and
+      are still attended to, but are never masked nor scored.
 
     Output:
 
@@ -104,7 +136,7 @@ def create_iterative_masking(input_id: List[int], mask_token: int, pad_token_id:
     attention_mask = torch.ones_like(input_id)  # Create attention mask
     attention_mask[input_id == pad_token_id] = 0  # Set padding tokens to 0
 
-    valid_positions = torch.nonzero(input_id != pad_token_id).flatten()
+    valid_positions = maskable_positions(input_id, pad_token_id, special_ids)
     n_valid = valid_positions.numel()
 
     masked_sequence = input_id.repeat(n_valid, 1)
@@ -118,7 +150,10 @@ def create_iterative_masking(input_id: List[int], mask_token: int, pad_token_id:
 
 
 def multiple_masked_ids(
-    batch: Dict[str, List[List[int]]], mask_token_id: int, pad_token_id: int
+    batch: Dict[str, List[List[int]]],
+    mask_token_id: int,
+    pad_token_id: int,
+    special_ids: Optional[Iterable[int]] = None,
 ):
     """
     Applies multiple masking to a batch of sequences.
@@ -127,6 +162,10 @@ def multiple_masked_ids(
     - batch: Batch of sequences with shape (batch_size, n_windows, window_size). Useful for hf datasets parallelization.
     - mask_token_id: Token ID for masking.
     - pad_token_id: Token ID for padding. Set to 0 by default.
+    - special_ids: Optional iterable of token IDs to exclude from masking
+      (e.g. ``[CLS]``/``[SEP]``). Must match what is passed to
+      ``create_iterative_masking`` so the masked rows and their labels stay
+      aligned.
 
     Output:
 
@@ -145,10 +184,13 @@ def multiple_masked_ids(
         ls_labels = []
         for row in input_id:
             input_id_out, attention_mask_out = create_iterative_masking(
-                row, mask_token=mask_token_id, pad_token_id=pad_token_id
+                row,
+                mask_token=mask_token_id,
+                pad_token_id=pad_token_id,
+                special_ids=special_ids,
             )
             row_tensor = torch.tensor(row, dtype=torch.long)
-            valid_positions = torch.nonzero(row_tensor != pad_token_id).flatten()
+            valid_positions = maskable_positions(row_tensor, pad_token_id, special_ids)
             labels = torch.full_like(input_id_out, -100)
             labels[torch.arange(valid_positions.numel()), valid_positions] = row_tensor[
                 valid_positions
@@ -175,12 +217,16 @@ def build_tensors_from_df(
     stride: int,
     mask_token_id: int,
     pad_token_id: int,
+    special_ids: Optional[Iterable[int]] = None,
 ):
     """
     Builds tensors from a DataFrame with text data.
 
     - df: DataFrame with text data. It must contain a column named "text".
     - tokenizer: Hugging Face tokenizer.
+    - special_ids: Optional iterable of token IDs to exclude from masking
+      (e.g. ``[CLS]``/``[SEP]``). When ``None`` (the default), only padding
+      is excluded, preserving the original behavior.
 
     Output:
 
@@ -201,16 +247,38 @@ def build_tensors_from_df(
 
     # Apply multiple masking to the dataset
     dataset = dataset.map(
-        lambda batch: multiple_masked_ids(batch, mask_token_id, pad_token_id),
+        lambda batch: multiple_masked_ids(
+            batch, mask_token_id, pad_token_id, special_ids
+        ),
         batched=True,
         remove_columns=["input_ids", "attention_mask"],  # Remove old columns
     )
 
-    # concatenate efficiently all the input_ids and attention_mask
+    # Concatenate efficiently all the input_ids, attention_mask and labels.
+    #
+    # When the dataset has multiple rows with differing inner shapes (the
+    # usual multi-document case), ``dataset[col]`` returns a Python list of
+    # 2D tensors, which ``torch.cat`` can concatenate along dim 0.
+    #
+    # However, when all rows happen to have the same inner shape -- for
+    # example a single-document dataset, which is what ``PPLBackend`` feeds
+    # in via ``_score_single`` -- the ``datasets`` library stacks the column
+    # into a single 3D tensor of shape (n_docs, n_masks, window_size).
+    # Passing that single tensor to ``torch.cat`` raises a TypeError. The
+    # helper below normalizes both cases to a 2D tensor of shape
+    # (sum_n_masks, window_size).
     dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
-    tensor_ids = torch.cat(dataset["input_ids"], dim=0)
-    tensor_attention_mask = torch.cat(dataset["attention_mask"], dim=0)
-    tensor_labels = torch.cat(dataset["labels"], dim=0)
+
+    def _flatten_column(column):
+        if isinstance(column, torch.Tensor):
+            if column.dim() <= 2:
+                return column
+            return column.reshape(-1, column.size(-1))
+        return torch.cat(list(column), dim=0)
+
+    tensor_ids = _flatten_column(dataset["input_ids"])
+    tensor_attention_mask = _flatten_column(dataset["attention_mask"])
+    tensor_labels = _flatten_column(dataset["labels"])
 
     return tensor_ids, tensor_attention_mask, tensor_labels
 
