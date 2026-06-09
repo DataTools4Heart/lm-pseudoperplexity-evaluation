@@ -135,6 +135,26 @@ def is_special_character(token):
     return all(not c.isalnum() for c in clean_token)
 
 
+def should_ignore_token(token, token_id=None, unk_token_id=None):
+    """Whether a token should be excluded from perplexity scoring and display.
+
+    Ignores tokens that are purely punctuation / special characters (see
+    :func:`is_special_character`) as well as the tokenizer's ``[UNK]`` token.
+
+    Args:
+        token: The token string.
+        token_id: The token's integer id (optional; only needed to detect
+            ``[UNK]`` by id).
+        unk_token_id: The tokenizer's ``unk_token_id`` (or None).
+
+    Returns:
+        True if the token should be ignored, False otherwise.
+    """
+    if unk_token_id is not None and token_id is not None and token_id == unk_token_id:
+        return True
+    return is_special_character(token)
+
+
 def load_model_and_tokenizer(model_name, model_type):
     """Load and cache model and tokenizer"""
     cache_key = f"{model_name}_{model_type}"
@@ -197,13 +217,9 @@ def calculate_decoder_perplexity(text, model, tokenizer):
     if input_ids.size(1) < 2:
         raise Exception("Text is too short for perplexity calculation.")
 
-    # Calculate overall perplexity
-    with torch.no_grad():
-        outputs = model(input_ids, labels=input_ids)
-        loss = outputs.loss
-        perplexity = torch.exp(loss).item()
-
-    # Get token-level perplexities
+    # Get per-token losses with a single forward pass. The overall perplexity
+    # is computed below from the kept tokens only, so punctuation and [UNK]
+    # are excluded from the score itself, not merely hidden from the display.
     with torch.no_grad():
         outputs = model(input_ids)
         logits = outputs.logits
@@ -217,28 +233,42 @@ def calculate_decoder_perplexity(text, model, tokenizer):
         token_losses = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
-        token_perplexities = torch.exp(token_losses).cpu().numpy()
+        token_losses = token_losses.cpu().numpy()
+        token_perplexities = np.exp(token_losses)
 
-        # Get tokens (excluding the first one since we predict next tokens)
-        tokens = tokenizer.convert_ids_to_tokens(input_ids[0][1:])
+        # Token ids being predicted (everything except the first input token).
+        predicted_ids = input_ids[0][1:].tolist()
+        tokens = tokenizer.convert_ids_to_tokens(predicted_ids)
 
-        # Clean up tokens for display and filter special characters
-        cleaned_tokens = []
-        filtered_perplexities = []
-        for token, token_perp in zip(tokens, token_perplexities):
-            # Skip special characters
-            if is_special_character(token):
-                continue
+    # Clean up tokens for display and filter out punctuation / [UNK]. The same
+    # filter drives both the per-token output and the overall perplexity.
+    unk_token_id = tokenizer.unk_token_id
+    cleaned_tokens = []
+    filtered_perplexities = []
+    kept_losses = []
+    for token, token_id, token_loss, token_perp in zip(
+        tokens, predicted_ids, token_losses, token_perplexities
+    ):
+        # Skip punctuation / special-character tokens and [UNK].
+        if should_ignore_token(token, token_id, unk_token_id):
+            continue
 
-            if token.startswith("Ġ"):
-                cleaned_tokens.append(token[1:])  # Remove Ġ prefix
-            elif token.startswith("Ċ"):
-                cleaned_tokens.append(token[1:])
-            elif token.startswith("##"):
-                cleaned_tokens.append(token[2:])  # Remove ## prefix
-            else:
-                cleaned_tokens.append(token)
-            filtered_perplexities.append(token_perp)
+        if token.startswith("Ġ"):
+            cleaned_tokens.append(token[1:])  # Remove Ġ prefix
+        elif token.startswith("Ċ"):
+            cleaned_tokens.append(token[1:])
+        elif token.startswith("##"):
+            cleaned_tokens.append(token[2:])  # Remove ## prefix
+        else:
+            cleaned_tokens.append(token)
+        filtered_perplexities.append(token_perp)
+        kept_losses.append(token_loss)
+
+    # Overall perplexity over kept (non-punctuation, non-[UNK]) tokens only.
+    if kept_losses:
+        perplexity = math.exp(float(np.mean(kept_losses)))
+    else:
+        perplexity = float("nan")
 
     return perplexity, cleaned_tokens, np.array(filtered_perplexities)
 
@@ -267,10 +297,19 @@ def calculate_encoder_perplexity(
         tokenizer.sep_token_id,
         tokenizer.pad_token_id,
     }
+    unk_token_id = tokenizer.unk_token_id
 
-    # Get content token indices (excluding special tokens)
+    # Token strings, used to detect punctuation / special-character tokens.
+    tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+
+    # Get content token indices, excluding structural special tokens,
+    # punctuation / special-character tokens, and [UNK]. Excluded positions
+    # are never masked, so they contribute nothing to the perplexity score.
     content_token_indices = [
-        i for i in range(seq_length) if input_ids[0, i].item() not in special_token_ids
+        i
+        for i in range(seq_length)
+        if input_ids[0, i].item() not in special_token_ids
+        and not should_ignore_token(tokens[i], input_ids[0, i].item(), unk_token_id)
     ]
 
     if not content_token_indices:
@@ -335,8 +374,8 @@ def calculate_encoder_perplexity(
     else:
         overall_perplexity = float("inf")
 
-    # Calculate mean perplexity per token for visualization
-    tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+    # Calculate mean perplexity per token for visualization (``tokens`` was
+    # computed above and is reused here).
     token_perplexities = []
 
     for i in range(len(tokens)):
@@ -353,10 +392,12 @@ def calculate_encoder_perplexity(
     cleaned_tokens = []
     filtered_perplexities = []
     for idx, (token, token_perp) in enumerate(zip(tokens, token_perplexities)):
-        # Skip special characters and tokenizer special tokens
-        if input_ids[0, idx].item() in special_token_ids:
+        # Skip structural special tokens, punctuation / special characters,
+        # and [UNK] -- matching what was excluded from the score above.
+        token_id = input_ids[0, idx].item()
+        if token_id in special_token_ids:
             continue
-        if is_special_character(token):
+        if should_ignore_token(token, token_id, unk_token_id):
             continue
 
         if token.startswith("##"):
