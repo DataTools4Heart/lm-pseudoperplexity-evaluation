@@ -274,10 +274,27 @@ def calculate_decoder_perplexity(text, model, tokenizer):
 
 
 def calculate_encoder_perplexity(
-    text, model, tokenizer, mask_probability=0.15, min_samples_per_token=10
+    text,
+    model,
+    tokenizer,
+    mask_probability=0.15,
+    min_samples_per_token=10,
+    seed=None,
 ):
-    """Calculate pseudo-perplexity for encoder models using statistical sampling with multiple token masking"""
+    """Calculate pseudo-perplexity for encoder models using statistical sampling with multiple token masking.
+
+    Args:
+        seed: Optional integer to seed the random masking. When provided the
+            sampling is reproducible across runs; when None the global RNG
+            state is used (results vary between runs).
+    """
     device = next(model.parameters()).device
+
+    # Use a local generator so seeding does not perturb global RNG state and
+    # concurrent calls with different seeds stay independent.
+    generator = torch.Generator(device="cpu")
+    if seed is not None:
+        generator.manual_seed(int(seed))
 
     # Tokenize the text
     inputs = tokenizer(
@@ -333,7 +350,7 @@ def calculate_encoder_perplexity(
 
             # Randomly mask tokens based on mask_probability
             for idx in content_token_indices:
-                if torch.rand(1).item() < mask_probability:
+                if torch.rand(1, generator=generator).item() < mask_probability:
                     masked_indices.append(idx)
                     masked_input[0, idx] = tokenizer.mask_token_id
 
@@ -413,7 +430,9 @@ def calculate_encoder_perplexity(
     return overall_perplexity, cleaned_tokens, np.array(filtered_perplexities)
 
 
-def process_text(text, model_name, model_type, mask_probability=0.15, min_samples=10):
+def process_text(
+    text, model_name, model_type, mask_probability=0.15, min_samples=10, seed=None
+):
     """Main processing function"""
     if not text.strip():
         return ERROR_MESSAGES["empty_text"], "", pd.DataFrame()
@@ -430,7 +449,7 @@ def process_text(text, model_name, model_type, mask_probability=0.15, min_sample
             sampling_info = ""
         else:  # encoder
             avg_perplexity, tokens, token_perplexities = calculate_encoder_perplexity(
-                text, model, tokenizer, mask_probability, min_samples
+                text, model, tokenizer, mask_probability, min_samples, seed=seed
             )
             sampling_info = f"**Mask Probability:** {mask_probability:.1%}  \n**Min Samples per Token:** {min_samples}  \n"
 

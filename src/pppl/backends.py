@@ -741,28 +741,32 @@ class MiniconsStridedBackend:
     length (matching how minicons itself behaves under the hood), this
     backend scores the entire document by:
 
-    1. Tokenizing the full document with ``add_special_tokens=False``.
-    2. Sliding a content window of size ``windows_size - 2`` (to leave
-       room for ``[CLS]``/``[SEP]``) across the token sequence with the
-       given ``stride``.
-    3. For each window, prepending ``cls_token_id`` and appending
-       ``sep_token_id`` and scoring it via minicons' ``prepare_text`` +
-       our chunked-forward helper.
-    4. Concatenating per-token log-probabilities from every window of the
-       document and returning ``exp(mean NLL)`` as the pseudo-perplexity.
-
-    This is roughly the same windowing policy used by :class:`PPLBackend`,
-    so the two are directly comparable on long documents (modulo minicons'
-    ``"original"`` PLL methodology).
+    1. Tokenizing the full document with ``add_special_tokens=False`` and
+       ``return_offsets_mapping=True`` to locate exact character boundaries
+       of each token in the original text.
+    2. Sliding a content window of ``windows_size − n_special`` tokens
+       (where ``n_special`` is the number of framing tokens the tokenizer
+       adds, typically 2 for ``[CLS]``/``[SEP]``) across the token sequence.
+    3. For each window, extracting the corresponding **text substring** and
+       re-tokenizing it with ``add_special_tokens=True``. The resulting
+       ``BatchEncoding`` has proper ``_encodings`` so
+       ``word_ids()`` works — enabling both ``"original"`` and
+       ``"within_word_l2r"`` PLL metrics.
+    4. Scoring each window via minicons' ``prepare_text`` + our
+       chunked-forward helper, concatenating per-token log-probabilities
+       across windows, and returning ``exp(mean NLL)``.
 
     Notes:
-        - Only the ``"original"`` PLL metric is supported. Minicons'
-          ``"within_word_l2r"`` requires ``encoded.word_ids(...)``, which
-          is unavailable when we build the windowed ``BatchEncoding``
-          manually from sliced token ids. Word boundaries also stop being
-          well-defined at window edges.
-        - With overlapping windows (``stride < windows_size - 2``) tokens
-          near boundaries are scored more than once -- the aggregation
+        - Requires a *fast* tokenizer (offset-mapping support).
+          Initialization raises ``ValueError`` if only a slow tokenizer is
+          available.
+        - Because each window is independently re-tokenized from its text
+          substring, BPE/SentencePiece merges at window edges may differ
+          very slightly from the full-document tokenization. The effect on
+          per-token NLLs is negligible (the model sees a valid, naturally
+          framed input for each window).
+        - With overlapping windows (``stride < content_window``) tokens
+          near boundaries are scored more than once — the aggregation
           treats every ``(token, window)`` pair as a sample, which is the
           same convention used by :class:`PPLBackend`.
 
@@ -770,6 +774,7 @@ class MiniconsStridedBackend:
         >>> backend = MiniconsStridedBackend(
         ...     'bert-base-uncased', device='cuda',
         ...     windows_size=512, stride=256, model_batch_size=8,
+        ...     pll_method='within_word_l2r',
         ... )
         >>> ppl = backend.get_perplexity(long_text)
     """
@@ -782,24 +787,27 @@ class MiniconsStridedBackend:
         stride: int = 256,
         model_batch_size: int = 32,
         show_progress: bool = False,
-        pll_method: Literal["within_word_l2r", "original"] = "within_word_l2r",
+        pll_method: Literal["within_word_l2r", "original"] = "original",
     ):
         """Initialize the strided minicons backend.
 
         Args:
             model_name: Hugging Face model name or path for a masked LM.
             device: Device to run the model on ('cpu' or 'cuda').
-            windows_size: Total tokenized window length, *including* the
-                two slots reserved for ``[CLS]`` and ``[SEP]``. Must be
-                ``>= 3`` and is automatically capped to the model's max
-                sequence length.
+            windows_size: Total tokenized window length, *including*
+                special tokens. Must be ``>= 3`` and is automatically
+                capped to the model's max sequence length.
             stride: Step (in content tokens) between successive windows.
-                ``stride == windows_size - 2`` gives disjoint windows;
-                smaller values produce overlap.
+                ``stride == windows_size - n_special`` gives disjoint
+                windows; smaller values produce overlap.
             model_batch_size: Masked-variant rows per model forward, the
                 same memory knob as on :class:`MiniconsBackend`.
             show_progress: If True, display a tqdm progress bar over
                 documents.
+            pll_method: PLL scoring strategy (``"original"`` or
+                ``"within_word_l2r"``). Both work because each window is
+                re-tokenized with the fast tokenizer, producing a proper
+                ``BatchEncoding`` with ``word_ids()`` support.
         """
         try:
             from minicons import scorer
@@ -809,14 +817,6 @@ class MiniconsStridedBackend:
                 "Install it with: pip install minicons"
             )
 
-        if windows_size < 3:
-            raise ValueError(
-                f"windows_size must be >= 3 (got {windows_size}); two slots "
-                "are reserved for [CLS] and [SEP]."
-            )
-        if stride <= 0:
-            raise ValueError(f"stride must be positive (got {stride}).")
-
         self._scorer = scorer.MaskedLMScorer(model_name, device)
         self.model_name = model_name
         self.device = device
@@ -825,18 +825,29 @@ class MiniconsStridedBackend:
         self.show_progress = show_progress
         self.pll_method = pll_method
 
-        cls_id = self.tokenizer.cls_token_id
-        sep_id = self.tokenizer.sep_token_id
-        if cls_id is None or sep_id is None:
+        # Fast-tokenizer check: we need offset_mapping for text-based
+        # window construction, and _encodings for word_ids().
+        if not getattr(self.tokenizer, "is_fast", False):
             raise ValueError(
-                "Tokenizer is missing cls_token_id or sep_token_id; "
-                "MiniconsStridedBackend requires both to wrap each window."
+                f"MiniconsStridedBackend requires a fast tokenizer for "
+                f"`{model_name}` (needed for offset_mapping and "
+                f"word_ids support). Only a slow tokenizer is available."
             )
-        self.cls_token_id = cls_id
-        self.sep_token_id = sep_id
 
-        # Cap windows_size at the model's actual max length to avoid the
-        # same positional-embedding crash MiniconsBackend guards against.
+        # How many framing tokens does the tokenizer add for a single
+        # sentence? (e.g. 2 for BERT/RoBERTa: [CLS] + [SEP]).
+        n_special = self.tokenizer.num_special_tokens_to_add(pair=False)
+
+        if windows_size < n_special + 1:
+            raise ValueError(
+                f"windows_size must be >= {n_special + 1} (got {windows_size}); "
+                f"{n_special} slot(s) are reserved for the tokenizer's "
+                "special tokens."
+            )
+        if stride <= 0:
+            raise ValueError(f"stride must be positive (got {stride}).")
+
+        # Cap windows_size at the model's actual max length.
         model_max = _resolve_model_max_length(self.tokenizer, self._scorer.model, None)
         if windows_size > model_max:
             warnings.warn(
@@ -845,7 +856,9 @@ class MiniconsStridedBackend:
                 stacklevel=2,
             )
             windows_size = model_max
+
         self.windows_size = windows_size
+        self._content_window = windows_size - n_special
         self.stride = stride
 
     def get_perplexity(self, text: Union[str, List[str]]) -> Union[float, List[float]]:
@@ -858,24 +871,9 @@ class MiniconsStridedBackend:
             A single perplexity score or list of scores. Each per-document
             score is ``exp(mean NLL across all (token, window) pairs)``.
         """
-        # ``BatchEncoding`` is re-exported by ``transformers`` at runtime
-        # but isn't always declared in its public type stubs; import it
-        # from the underlying module to keep type-checkers happy.
-        from transformers.tokenization_utils_base import BatchEncoding
-
         single = isinstance(text, str)
         if single:
             text = [text]
-
-        # Tokenize each doc to raw content ids (no [CLS]/[SEP]) so we can
-        # slide windows over them and reattach specials per window.
-        content = self.tokenizer(
-            text,
-            padding=False,
-            truncation=False,
-            add_special_tokens=False,
-            return_attention_mask=False,
-        )["input_ids"]
 
         iterator: Union[range, "tqdm"] = range(len(text))
         if self.show_progress and len(text) > 1:
@@ -885,50 +883,59 @@ class MiniconsStridedBackend:
                 total=len(text),
             )
 
-        content_window = self.windows_size - 2  # leave room for CLS + SEP
         scores: List[float] = []
 
         for i in iterator:
-            ids = list(content[i])
-            if not ids:
-                scores.append(float("nan"))
-                continue
+            text_i = text[i]
 
-            # Build all windowed BatchEncoding rows for this doc.
-            window_inputs: List[List[int]] = []
-            window_masks: List[List[int]] = []
-            start = 0
-            while start < len(ids):
-                chunk = ids[start : start + content_window]
-                if not chunk:
-                    break
-                row = [self.cls_token_id] + chunk + [self.sep_token_id]
-                window_inputs.append(row)
-                window_masks.append([1] * len(row))
-                if start + content_window >= len(ids):
-                    break  # this window already reaches the end of the doc
-                start += self.stride
-
-            if not window_inputs:
-                scores.append(float("nan"))
-                continue
-
-            # One BatchEncoding holding every window as a separate row;
-            # minicons' get_masked_tensors yields per-row tuples, so
-            # variable-length rows are fine -- nothing is concatenated
-            # across rows until our chunked-forward helper runs (per row).
-            encoded = BatchEncoding(
-                {"input_ids": window_inputs, "attention_mask": window_masks}
+            # Tokenize the full doc without specials to get offset_mapping.
+            full = self.tokenizer(
+                text_i,
+                padding=False,
+                truncation=False,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+                return_attention_mask=False,
             )
+            offsets = full["offset_mapping"]
+            n = len(offsets)
+            if n == 0:
+                scores.append(float("nan"))
+                continue
 
+            # Slide a window of _content_window tokens across the document,
+            # extract the text substring for each, and re-tokenize it with
+            # specials so the BatchEncoding has proper _encodings
+            # (word_ids() support).
             doc_logprobs: List[torch.Tensor] = []
-            for masked_tensors in self._scorer.prepare_text(
-                encoded, PLL_metric=self.pll_method
-            ):
-                window_lp = _minicons_chunked_forward(
-                    self._scorer, masked_tensors, self.model_batch_size
+            start = 0
+            while start < n:
+                end = min(start + self._content_window, n)
+                char_start = offsets[start][0]
+                char_end = offsets[end - 1][1]
+                chunk_text = text_i[char_start:char_end]
+
+                # Tokenize the window text *with* specials → proper
+                # BatchEncoding whose _encodings track word boundaries.
+                window_enc = self.tokenizer(
+                    [chunk_text],
+                    padding=False,
+                    truncation=True,
+                    max_length=self.windows_size,
+                    return_attention_mask=True,
                 )
-                doc_logprobs.append(window_lp)
+
+                for masked_tensors in self._scorer.prepare_text(
+                    window_enc, PLL_metric=self.pll_method
+                ):
+                    window_lp = _minicons_chunked_forward(
+                        self._scorer, masked_tensors, self.model_batch_size
+                    )
+                    doc_logprobs.append(window_lp)
+
+                if start + self._content_window >= n:
+                    break
+                start += self.stride
 
             if not doc_logprobs:
                 scores.append(float("nan"))
